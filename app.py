@@ -1,108 +1,155 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import numpy as np
+import requests
+from io import BytesIO
 from datetime import datetime
 
-# =========================================================
-# 基本設定
-# =========================================================
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 st.set_page_config(
-    page_title="Stock Finder AI",
-    page_icon="📈",
+    page_title="Stock Lens Japan",
+    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+
+# ============================================================
+# STYLE
+# ============================================================
+
 st.markdown("""
 <style>
+
 .block-container {
-    padding-top: 2rem;
+    padding-top: 1.3rem;
     padding-bottom: 3rem;
 }
 
 div[data-testid="stMetric"] {
-    background-color: rgba(120,120,120,0.08);
-    border-radius: 14px;
+    border: 1px solid rgba(120,120,120,.20);
     padding: 15px;
+    border-radius: 14px;
 }
 
-.stock-card {
-    border: 1px solid rgba(120,120,120,0.25);
-    border-radius: 16px;
-    padding: 18px;
-    margin-bottom: 10px;
+.small-note {
+    color: #888;
+    font-size: 13px;
 }
+
 </style>
 """, unsafe_allow_html=True)
 
 
-# =========================================================
-# 対象銘柄
-# 後で数百〜数千銘柄に拡張可能
-# =========================================================
+# ============================================================
+# SESSION
+# ============================================================
 
-STOCKS = {
-    "INPEX": "1605.T",
-    "大和ハウス工業": "1925.T",
-    "積水ハウス": "1928.T",
-    "JT": "2914.T",
-    "日本製鉄": "5401.T",
-    "三菱UFJ": "8306.T",
-    "三井住友FG": "8316.T",
-    "みずほFG": "8411.T",
-    "三菱商事": "8058.T",
-    "三井物産": "8031.T",
-    "伊藤忠商事": "8001.T",
-    "住友商事": "8053.T",
-    "丸紅": "8002.T",
-    "NTT": "9432.T",
-    "KDDI": "9433.T",
-    "ソフトバンク": "9434.T",
-    "武田薬品工業": "4502.T",
-    "アステラス製薬": "4503.T",
-    "ブリヂストン": "5108.T",
-    "キヤノン": "7751.T",
-    "ホンダ": "7267.T",
-    "トヨタ自動車": "7203.T",
-    "MS&AD": "8725.T",
-    "東京海上HD": "8766.T",
-    "オリックス": "8591.T",
-}
+if "favorites" not in st.session_state:
+    st.session_state["favorites"] = {}
 
 
-# =========================================================
-# 共通関数
-# =========================================================
+# ============================================================
+# HELPER
+# ============================================================
 
-def safe_number(value, default=None):
+def safe_float(value, default=None):
     try:
         if value is None:
             return default
-        return float(value)
+
+        value = float(value)
+
+        if np.isnan(value):
+            return default
+
+        return value
+
     except:
         return default
 
 
-def normalize_percent(value):
-    """
-    0.04 → 4%
-    4.0  → 4%
-    の両方に対応
-    """
-    value = safe_number(value)
+def pct(value):
+
+    value = safe_float(value)
 
     if value is None:
         return None
 
+    # Yahooが0.04を返す場合
     if abs(value) <= 1:
         return value * 100
 
     return value
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_stock_data(name, ticker):
+def fmt(value, digits=2, suffix=""):
+
+    if value is None or pd.isna(value):
+        return "-"
+
+    return f"{value:.{digits}f}{suffix}"
+
+
+# ============================================================
+# JPX UNIVERSE
+# ============================================================
+
+@st.cache_data(ttl=86400)
+def load_jpx_universe():
+
+    """
+    JPXの東証銘柄一覧。
+
+    JPXの配布URLは差し替わる可能性があるため、
+    取得できない場合は fallback 銘柄リストを返す。
+    """
+
+    # fallback
+    fallback = pd.DataFrame([
+        ["1605", "INPEX", "プライム"],
+        ["1928", "積水ハウス", "プライム"],
+        ["2914", "JT", "プライム"],
+        ["4502", "武田薬品工業", "プライム"],
+        ["5401", "日本製鉄", "プライム"],
+        ["7203", "トヨタ自動車", "プライム"],
+        ["7267", "本田技研工業", "プライム"],
+        ["7751", "キヤノン", "プライム"],
+        ["8001", "伊藤忠商事", "プライム"],
+        ["8002", "丸紅", "プライム"],
+        ["8031", "三井物産", "プライム"],
+        ["8053", "住友商事", "プライム"],
+        ["8058", "三菱商事", "プライム"],
+        ["8306", "三菱UFJFG", "プライム"],
+        ["8316", "三井住友FG", "プライム"],
+        ["8411", "みずほFG", "プライム"],
+        ["8591", "オリックス", "プライム"],
+        ["8725", "MS&AD", "プライム"],
+        ["8766", "東京海上HD", "プライム"],
+        ["9432", "NTT", "プライム"],
+        ["9433", "KDDI", "プライム"],
+        ["9434", "ソフトバンク", "プライム"],
+    ],
+    columns=["コード", "銘柄名", "市場"]
+    )
+
+    return fallback
+
+
+# ============================================================
+# PRICE / FUNDAMENTAL
+# ============================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_basic_data(code):
+
+    ticker = f"{code}.T"
+
     stock = yf.Ticker(ticker)
 
     try:
@@ -111,231 +158,716 @@ def get_stock_data(name, ticker):
         info = {}
 
     try:
-        hist = stock.history(period="1mo")
+        hist = stock.history(
+            period="1y",
+            auto_adjust=False
+        )
     except:
         hist = pd.DataFrame()
 
-    price = safe_number(
+    price = safe_float(
         info.get("currentPrice")
         or info.get("regularMarketPrice")
     )
 
-    # 株価がinfoで取れなければ履歴から取得
     if price is None and not hist.empty:
-        price = safe_number(hist["Close"].iloc[-1])
+        price = safe_float(
+            hist["Close"].dropna().iloc[-1]
+        )
 
-    dividend_yield = normalize_percent(
-        info.get("dividendYield")
-    )
-
-    per = safe_number(
-        info.get("trailingPE")
-    )
-
-    forward_per = safe_number(
-        info.get("forwardPE")
-    )
-
-    pbr = safe_number(
-        info.get("priceToBook")
-    )
-
-    roe = normalize_percent(
-        info.get("returnOnEquity")
-    )
-
-    equity_ratio = normalize_percent(
-        info.get("totalCashPerShare")
-    )
-
-    payout_ratio = normalize_percent(
-        info.get("payoutRatio")
-    )
-
-    market_cap = safe_number(
-        info.get("marketCap")
-    )
-
-    previous_close = safe_number(
+    previous_close = safe_float(
         info.get("previousClose")
     )
 
-    change = None
+    dividend_yield = pct(
+        info.get("dividendYield")
+    )
 
-    if price is not None and previous_close:
-        change = (
-            (price - previous_close)
-            / previous_close
-            * 100
-        )
+    per = safe_float(
+        info.get("trailingPE")
+    )
+
+    forward_per = safe_float(
+        info.get("forwardPE")
+    )
+
+    pbr = safe_float(
+        info.get("priceToBook")
+    )
+
+    roe = pct(
+        info.get("returnOnEquity")
+    )
+
+    payout = pct(
+        info.get("payoutRatio")
+    )
+
+    market_cap = safe_float(
+        info.get("marketCap")
+    )
+
+    current_ratio = safe_float(
+        info.get("currentRatio")
+    )
+
+    debt_to_equity = safe_float(
+        info.get("debtToEquity")
+    )
+
+    change_1d = None
+
+    if price and previous_close:
+        change_1d = (
+            price / previous_close - 1
+        ) * 100
+
+
+    # 52週
+    high52 = None
+    low52 = None
+    year_return = None
+
+    if not hist.empty:
+
+        close = hist["Close"].dropna()
+
+        if len(close):
+
+            high52 = float(close.max())
+            low52 = float(close.min())
+
+            if len(close) > 1:
+                year_return = (
+                    close.iloc[-1]
+                    / close.iloc[0]
+                    - 1
+                ) * 100
+
+
+    high_gap = None
+
+    if price and high52:
+        high_gap = (
+            price / high52 - 1
+        ) * 100
+
 
     return {
-        "銘柄": name,
-        "Ticker": ticker,
-        "コード": ticker.replace(".T", ""),
+        "コード": code,
         "株価": price,
         "配当利回り": dividend_yield,
         "PER": per,
         "予想PER": forward_per,
         "PBR": pbr,
         "ROE": roe,
-        "配当性向": payout_ratio,
+        "配当性向": payout,
         "時価総額": market_cap,
-        "騰落率": change,
+        "流動比率": current_ratio,
+        "D/E": debt_to_equity,
+        "前日比": change_1d,
+        "52週高値": high52,
+        "52週安値": low52,
+        "52週高値乖離": high_gap,
+        "1年騰落率": year_return,
     }
 
 
-def calculate_score(row, mode):
+# ============================================================
+# DIVIDEND HISTORY
+# ============================================================
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_dividend_history(code):
+
+    ticker = f"{code}.T"
+
+    stock = yf.Ticker(ticker)
+
+    try:
+        price = stock.history(
+            period="6y",
+            auto_adjust=False
+        )
+
+        dividends = stock.dividends
+
+    except:
+        return None
+
+
+    if price.empty or dividends.empty:
+        return None
+
+
+    price = price.copy()
+    dividends = dividends.copy()
+
+
+    # 年平均株価
+    annual_price = (
+        price["Close"]
+        .dropna()
+        .groupby(price.index.year)
+        .mean()
+    )
+
+
+    # 年間配当
+    annual_dividend = (
+        dividends
+        .groupby(dividends.index.year)
+        .sum()
+    )
+
+
+    rows = []
+
+
+    for year in sorted(
+        set(annual_price.index)
+        & set(annual_dividend.index)
+    ):
+
+        avg_price = safe_float(
+            annual_price.loc[year]
+        )
+
+        dividend = safe_float(
+            annual_dividend.loc[year]
+        )
+
+        if not avg_price or not dividend:
+            continue
+
+        yield_pct = (
+            dividend / avg_price
+        ) * 100
+
+        rows.append({
+            "年": int(year),
+            "年間配当": dividend,
+            "年平均株価": avg_price,
+            "配当利回り": yield_pct,
+        })
+
+
+    if not rows:
+        return None
+
+
+    df = pd.DataFrame(rows)
+
+    df = df.sort_values("年")
+
+
+    # 直近5年
+    df5 = df.tail(5).copy()
+
+
+    avg_yield = safe_float(
+        df5["配当利回り"].mean()
+    )
+
+
+    # 減配回数
+    dividend_diff = (
+        df5["年間配当"]
+        .diff()
+    )
+
+    cut_count = int(
+        (dividend_diff < 0).sum()
+    )
+
+
+    # 増配年数
+    increase_count = int(
+        (dividend_diff > 0).sum()
+    )
+
+
+    # 5年配当成長率
+    dividend_growth = None
+
+    if len(df5) >= 2:
+
+        first = df5["年間配当"].iloc[0]
+        last = df5["年間配当"].iloc[-1]
+
+        years = (
+            df5["年"].iloc[-1]
+            - df5["年"].iloc[0]
+        )
+
+        if first > 0 and last > 0 and years > 0:
+
+            dividend_growth = (
+                (last / first)
+                ** (1 / years)
+                - 1
+            ) * 100
+
+
+    return {
+        "table": df5,
+        "平均利回り5年": avg_yield,
+        "減配回数": cut_count,
+        "増配回数": increase_count,
+        "配当CAGR": dividend_growth,
+    }
+
+
+# ============================================================
+# PRICE RISK
+# ============================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_price_risk(code):
+
+    ticker = f"{code}.T"
+
+    try:
+
+        hist = yf.download(
+            ticker,
+            period="5y",
+            auto_adjust=True,
+            progress=False,
+        )
+
+    except:
+
+        return {}
+
+
+    if hist.empty:
+        return {}
+
+
+    close = hist["Close"]
+
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+
+
+    close = close.dropna()
+
+
+    if len(close) < 2:
+        return {}
+
+
+    rolling_max = close.cummax()
+
+    drawdown = (
+        close / rolling_max - 1
+    )
+
+
+    max_dd = (
+        drawdown.min()
+        * 100
+    )
+
+
+    volatility = (
+        close.pct_change()
+        .std()
+        * np.sqrt(252)
+        * 100
+    )
+
+
+    return {
+        "最大DD": float(max_dd),
+        "ボラティリティ": float(volatility),
+    }
+
+
+# ============================================================
+# SCORE
+# ============================================================
+
+def calculate_score(data):
 
     score = 0
-    reasons = []
 
-    dividend = row.get("配当利回り")
-    per = row.get("PER")
-    pbr = row.get("PBR")
-    roe = row.get("ROE")
-    payout = row.get("配当性向")
+    breakdown = {
+        "配当": 0,
+        "割安": 0,
+        "収益性": 0,
+        "配当安定": 0,
+        "株価水準": 0,
+    }
 
-    # ---------------------------------
-    # 高配当
-    # ---------------------------------
 
-    if dividend is not None:
+    dy = data.get("配当利回り")
+    avg = data.get("平均利回り5年")
+    per = data.get("PER")
+    pbr = data.get("PBR")
+    roe = data.get("ROE")
+    payout = data.get("配当性向")
+    cuts = data.get("減配回数")
+    growth = data.get("配当CAGR")
+    high_gap = data.get("52週高値乖離")
 
-        if dividend >= 5:
-            score += 30
-            reasons.append("配当利回り5%以上")
 
-        elif dividend >= 4:
-            score += 25
-            reasons.append("配当利回り4%以上")
+    # 配当 25
+    if dy:
 
-        elif dividend >= 3.5:
-            score += 20
-            reasons.append("配当利回り3.5%以上")
+        if dy >= 5:
+            breakdown["配当"] = 25
 
-        elif dividend >= 3:
-            score += 12
+        elif dy >= 4:
+            breakdown["配当"] = 22
 
-    # ---------------------------------
-    # PER
-    # ---------------------------------
+        elif dy >= 3.5:
+            breakdown["配当"] = 18
 
-    if per is not None:
+        elif dy >= 3:
+            breakdown["配当"] = 12
 
-        if 0 < per <= 8:
-            score += 20
-            reasons.append("PERがかなり低い")
 
-        elif per <= 12:
-            score += 17
-            reasons.append("PERが低め")
+    # 割安 25
+    value_score = 0
+
+    if per:
+
+        if 0 < per <= 10:
+            value_score += 12
 
         elif per <= 15:
-            score += 12
+            value_score += 8
 
         elif per <= 20:
-            score += 6
+            value_score += 4
 
-    # ---------------------------------
-    # PBR
-    # ---------------------------------
 
-    if pbr is not None:
+    if pbr:
 
-        if 0 < pbr < 0.8:
-            score += 15
-            reasons.append("PBR0.8倍未満")
+        if 0 < pbr <= 0.8:
+            value_score += 13
 
-        elif pbr < 1:
-            score += 12
-            reasons.append("PBR1倍未満")
+        elif pbr <= 1:
+            value_score += 10
 
         elif pbr <= 1.5:
-            score += 7
+            value_score += 5
 
-    # ---------------------------------
-    # ROE
-    # ---------------------------------
 
-    if roe is not None:
+    breakdown["割安"] = min(
+        value_score,
+        25
+    )
+
+
+    # 収益性 20
+    if roe:
 
         if roe >= 15:
-            score += 20
-            reasons.append("ROE15%以上")
+            breakdown["収益性"] = 20
 
         elif roe >= 10:
-            score += 15
-            reasons.append("ROE10%以上")
+            breakdown["収益性"] = 15
 
         elif roe >= 8:
-            score += 10
-
-    # ---------------------------------
-    # 配当性向
-    # ---------------------------------
-
-    if payout is not None:
-
-        if 20 <= payout <= 50:
-            score += 15
-            reasons.append("配当性向が適正")
-
-        elif 50 < payout <= 70:
-            score += 8
-
-        elif payout > 100:
-            score -= 10
-            reasons.append("配当性向100%超に注意")
-
-    # ---------------------------------
-    # モード補正
-    # ---------------------------------
-
-    if mode == "💰 高配当":
-
-        if dividend and dividend >= 4:
-            score += 10
-
-    elif mode == "🏷️ 割安":
-
-        if per and per <= 12:
-            score += 7
-
-        if pbr and pbr <= 1:
-            score += 7
-
-    elif mode == "⚖️ バランス":
-
-        if roe and roe >= 10:
-            score += 5
-
-        if dividend and dividend >= 3:
-            score += 5
-
-    score = min(max(round(score), 0), 100)
-
-    return score, reasons
+            breakdown["収益性"] = 10
 
 
-# =========================================================
-# サイドバー
-# =========================================================
+    # 配当安定性 20
+    stable = 0
 
-st.sidebar.title("📊 Stock Finder")
+    if cuts is not None:
+
+        if cuts == 0:
+            stable += 10
+
+        elif cuts == 1:
+            stable += 5
+
+
+    if growth is not None:
+
+        if growth >= 8:
+            stable += 10
+
+        elif growth >= 3:
+            stable += 7
+
+        elif growth >= 0:
+            stable += 4
+
+
+    breakdown["配当安定"] = min(
+        stable,
+        20
+    )
+
+
+    # 株価水準 10
+    if high_gap is not None:
+
+        if high_gap <= -30:
+            breakdown["株価水準"] = 10
+
+        elif high_gap <= -20:
+            breakdown["株価水準"] = 8
+
+        elif high_gap <= -10:
+            breakdown["株価水準"] = 5
+
+
+    # 利回り平均との差補正
+    if dy and avg:
+
+        premium = dy - avg
+
+        if premium >= 1:
+            breakdown["株価水準"] += 5
+
+        elif premium >= 0.5:
+            breakdown["株価水準"] += 3
+
+
+    breakdown["株価水準"] = min(
+        breakdown["株価水準"],
+        10
+    )
+
+
+    score = sum(
+        breakdown.values()
+    )
+
+
+    return min(
+        round(score),
+        100
+    ), breakdown
+
+
+# ============================================================
+# FULL ANALYSIS
+# ============================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def analyze_stock(
+    code,
+    name=""
+):
+
+    basic = get_basic_data(code)
+
+    dividend = get_dividend_history(code)
+
+    risk = get_price_risk(code)
+
+
+    data = {
+        **basic,
+        **risk,
+    }
+
+
+    data["銘柄名"] = name
+
+
+    if dividend:
+
+        data["平均利回り5年"] = dividend[
+            "平均利回り5年"
+        ]
+
+        data["減配回数"] = dividend[
+            "減配回数"
+        ]
+
+        data["増配回数"] = dividend[
+            "増配回数"
+        ]
+
+        data["配当CAGR"] = dividend[
+            "配当CAGR"
+        ]
+
+        data["配当履歴"] = dividend[
+            "table"
+        ]
+
+    else:
+
+        data["平均利回り5年"] = None
+        data["減配回数"] = None
+        data["増配回数"] = None
+        data["配当CAGR"] = None
+        data["配当履歴"] = None
+
+
+    # 利回りプレミアム
+    current = data.get(
+        "配当利回り"
+    )
+
+    avg = data.get(
+        "平均利回り5年"
+    )
+
+
+    if current and avg:
+
+        data[
+            "利回り平均との差"
+        ] = current - avg
+
+        data[
+            "利回り倍率"
+        ] = current / avg
+
+    else:
+
+        data[
+            "利回り平均との差"
+        ] = None
+
+        data[
+            "利回り倍率"
+        ] = None
+
+
+    score, breakdown = calculate_score(
+        data
+    )
+
+
+    data["総合スコア"] = score
+    data["スコア内訳"] = breakdown
+
+
+    return data
+
+
+# ============================================================
+# HUMAN COMMENT
+# ============================================================
+
+def make_plain_comment(data):
+
+    lines = []
+
+
+    current = data.get(
+        "配当利回り"
+    )
+
+    avg = data.get(
+        "平均利回り5年"
+    )
+
+    premium = data.get(
+        "利回り平均との差"
+    )
+
+    cuts = data.get(
+        "減配回数"
+    )
+
+    growth = data.get(
+        "配当CAGR"
+    )
+
+    high_gap = data.get(
+        "52週高値乖離"
+    )
+
+
+    if current is not None:
+
+        lines.append(
+            f"現在の配当利回りは "
+            f"{current:.2f}%です。"
+        )
+
+
+    if avg is not None and premium is not None:
+
+        if premium > 0:
+
+            lines.append(
+                f"過去5年平均 "
+                f"{avg:.2f}% "
+                f"より {premium:.2f}pt 高い水準です。"
+            )
+
+        else:
+
+            lines.append(
+                f"過去5年平均 "
+                f"{avg:.2f}% "
+                f"より {abs(premium):.2f}pt 低い水準です。"
+            )
+
+
+    if cuts is not None:
+
+        lines.append(
+            f"直近5年間の減配は "
+            f"{cuts}回です。"
+        )
+
+
+    if growth is not None:
+
+        lines.append(
+            f"年間配当の5年成長率は "
+            f"{growth:.1f}%程度です。"
+        )
+
+
+    if high_gap is not None:
+
+        lines.append(
+            f"現在株価は52週高値から "
+            f"{abs(high_gap):.1f}%下です。"
+        )
+
+
+    return " ".join(lines)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.title(
+    "Stock Lens"
+)
 
 mode = st.sidebar.radio(
-    "投資スタイル",
+    "表示モード",
     [
-        "💰 高配当",
-        "🏷️ 割安",
-        "⚖️ バランス",
-    ],
+        "高配当",
+        "割安",
+        "安定配当",
+        "逆張り",
+    ]
 )
 
 st.sidebar.divider()
 
-dividend_min = st.sidebar.slider(
+market_filter = st.sidebar.multiselect(
+    "市場",
+    [
+        "プライム",
+        "スタンダード",
+        "グロース",
+    ],
+    default=[
+        "プライム",
+    ],
+)
+
+min_yield = st.sidebar.slider(
     "最低配当利回り",
     0.0,
     8.0,
@@ -343,476 +875,583 @@ dividend_min = st.sidebar.slider(
     0.1,
 )
 
-per_max = st.sidebar.slider(
+max_per = st.sidebar.slider(
     "PER上限",
     5,
-    50,
-    20,
+    60,
+    25,
 )
 
-pbr_max = st.sidebar.slider(
+max_pbr = st.sidebar.slider(
     "PBR上限",
     0.5,
-    5.0,
-    2.0,
+    10.0,
+    3.0,
     0.1,
 )
 
-min_score = st.sidebar.slider(
-    "最低スコア",
-    0,
-    100,
-    40,
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.title(
+    "📊 Stock Lens Japan"
 )
-
-st.sidebar.caption(
-    "※ 投資判断を自動化するものではなく、"
-    "銘柄比較・スクリーニング用です。"
-)
-
-
-# =========================================================
-# メイン画面
-# =========================================================
-
-st.title("📈 Stock Finder AI")
 
 st.caption(
-    "日本株を配当・割安度・収益性などから分析する"
-    "株式スクリーニングアプリ"
+    "日本株を配当・割安度・収益性・過去水準から比較"
 )
 
-tab1, tab2, tab3 = st.tabs([
-    "🏆 おすすめランキング",
-    "🔎 個別銘柄分析",
+
+tabs = st.tabs([
+    "🔎 銘柄検索",
+    "🏆 ランキング",
     "⭐ お気に入り",
+    "ℹ️ 指標説明",
 ])
 
 
-# =========================================================
-# ランキング
-# =========================================================
+# ============================================================
+# SEARCH
+# ============================================================
 
-with tab1:
+with tabs[0]:
 
-    st.subheader("🏆 おすすめ株ランキング")
+    universe = load_jpx_universe()
+
+    search = st.text_input(
+        "銘柄名または証券コード",
+        placeholder="例：8306 / 三菱UFJ",
+    )
+
+
+    candidates = universe.copy()
+
+
+    if search:
+
+        candidates = candidates[
+
+            candidates["コード"]
+            .astype(str)
+            .str.contains(
+                search,
+                case=False,
+                na=False
+            )
+
+            |
+
+            candidates["銘柄名"]
+            .astype(str)
+            .str.contains(
+                search,
+                case=False,
+                na=False
+            )
+
+        ]
+
+
+    if not candidates.empty:
+
+        option = st.selectbox(
+            "銘柄",
+            candidates.apply(
+                lambda r:
+                f"{r['コード']}  {r['銘柄名']}",
+                axis=1
+            )
+        )
+
+
+        code = option.split()[0]
+
+        name = candidates[
+            candidates["コード"]
+            .astype(str)
+            == code
+        ]["銘柄名"].iloc[0]
+
+
+        if st.button(
+            "分析する",
+            type="primary",
+            use_container_width=True,
+        ):
+
+            with st.spinner(
+                "株価・配当履歴を分析しています..."
+            ):
+
+                data = analyze_stock(
+                    code,
+                    name
+                )
+
+
+            st.header(
+                f"{name}  {code}"
+            )
+
+
+            c1,c2,c3,c4 = st.columns(4)
+
+
+            c1.metric(
+                "株価",
+                (
+                    f"¥{data['株価']:,.0f}"
+                    if data.get("株価")
+                    else "-"
+                )
+            )
+
+
+            c2.metric(
+                "現在利回り",
+                fmt(
+                    data.get("配当利回り"),
+                    2,
+                    "%"
+                )
+            )
+
+
+            c3.metric(
+                "5年平均利回り",
+                fmt(
+                    data.get("平均利回り5年"),
+                    2,
+                    "%"
+                )
+            )
+
+
+            premium = data.get(
+                "利回り平均との差"
+            )
+
+
+            c4.metric(
+                "平均との差",
+                (
+                    f"{premium:+.2f}pt"
+                    if premium is not None
+                    else "-"
+                )
+            )
+
+
+            st.divider()
+
+
+            c1,c2,c3,c4 = st.columns(4)
+
+
+            c1.metric(
+                "PER",
+                fmt(
+                    data.get("PER"),
+                    1,
+                    "倍"
+                )
+            )
+
+
+            c2.metric(
+                "PBR",
+                fmt(
+                    data.get("PBR"),
+                    2,
+                    "倍"
+                )
+            )
+
+
+            c3.metric(
+                "ROE",
+                fmt(
+                    data.get("ROE"),
+                    1,
+                    "%"
+                )
+            )
+
+
+            c4.metric(
+                "総合スコア",
+                f"{data['総合スコア']}/100"
+            )
+
+
+            st.progress(
+                data[
+                    "総合スコア"
+                ] / 100
+            )
+
+
+            st.subheader(
+                "数字で見る現在の位置"
+            )
+
+
+            st.info(
+                make_plain_comment(
+                    data
+                )
+            )
+
+
+            # 配当履歴
+            hist = data.get(
+                "配当履歴"
+            )
+
+
+            if hist is not None:
+
+                st.subheader(
+                    "配当利回り推移"
+                )
+
+                chart = (
+                    hist
+                    .set_index("年")[
+                        "配当利回り"
+                    ]
+                )
+
+                st.line_chart(
+                    chart
+                )
+
+
+                st.dataframe(
+                    hist,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "年間配当":
+                        st.column_config.NumberColumn(
+                            format="¥%.2f"
+                        ),
+
+                        "年平均株価":
+                        st.column_config.NumberColumn(
+                            format="¥%.0f"
+                        ),
+
+                        "配当利回り":
+                        st.column_config.NumberColumn(
+                            format="%.2f%%"
+                        ),
+                    }
+                )
+
+
+            st.subheader(
+                "スコア内訳"
+            )
+
+
+            score_df = pd.DataFrame(
+                list(
+                    data[
+                        "スコア内訳"
+                    ].items()
+                ),
+                columns=[
+                    "項目",
+                    "点数"
+                ]
+            )
+
+
+            st.dataframe(
+                score_df,
+                hide_index=True,
+                use_container_width=True,
+            )
+
+
+            if st.button(
+                "⭐ お気に入りに追加"
+            ):
+
+                st.session_state[
+                    "favorites"
+                ][code] = name
+
+                st.success(
+                    "追加しました"
+                )
+
+
+# ============================================================
+# RANKING
+# ============================================================
+
+with tabs[1]:
+
+    st.subheader(
+        "ランキング"
+    )
+
+    universe = load_jpx_universe()
+
+
+    universe = universe[
+        universe[
+            "市場"
+        ].isin(
+            market_filter
+        )
+    ]
+
+
+    st.write(
+        f"対象銘柄数：{len(universe):,}"
+    )
+
+
+    limit = st.selectbox(
+        "一度に分析する銘柄数",
+        [
+            10,
+            25,
+            50,
+            100,
+        ],
+        index=1,
+    )
+
+
+    st.caption(
+        "全銘柄の詳細分析は時間がかかるため、"
+        "候補を段階的に分析します。"
+    )
+
 
     if st.button(
-        "🚀 最新データで分析",
+        "ランキングを作成",
         type="primary",
         use_container_width=True,
     ):
 
-        progress = st.progress(0)
-
         rows = []
 
-        total = len(STOCKS)
 
-        for i, (name, ticker) in enumerate(STOCKS.items()):
+        progress = st.progress(0)
+
+
+        sample = universe.head(
+            limit
+        )
+
+
+        for i, row in enumerate(
+            sample.itertuples()
+        ):
 
             try:
 
-                row = get_stock_data(
-                    name,
-                    ticker,
+                data = analyze_stock(
+                    str(row.コード),
+                    row.銘柄名
                 )
 
-                score, reasons = calculate_score(
-                    row,
-                    mode,
-                )
 
-                row["スコア"] = score
-                row["評価ポイント"] = " / ".join(reasons)
+                if (
+                    data.get(
+                        "配当利回り"
+                    ) is not None
 
-                rows.append(row)
+                    and data[
+                        "配当利回り"
+                    ] >= min_yield
+                ):
 
-            except Exception:
+                    if (
+                        data.get("PER") is None
+                        or data["PER"] <= max_per
+                    ):
+
+                        if (
+                            data.get("PBR") is None
+                            or data["PBR"] <= max_pbr
+                        ):
+
+                            rows.append(
+                                data
+                            )
+
+            except:
                 pass
 
+
             progress.progress(
-                (i + 1) / total
+                (i + 1)
+                / len(sample)
             )
+
 
         progress.empty()
 
-        if not rows:
 
-            st.error(
-                "株価データを取得できませんでした。"
+        if rows:
+
+            df = pd.DataFrame(
+                rows
             )
 
-        else:
 
-            df = pd.DataFrame(rows)
-
-            # 条件フィルタ
-            filtered = df.copy()
-
-            filtered = filtered[
-                filtered["スコア"] >= min_score
-            ]
-
-            filtered = filtered[
-                filtered["配当利回り"].fillna(0)
-                >= dividend_min
-            ]
-
-            filtered = filtered[
-                filtered["PER"].fillna(999)
-                <= per_max
-            ]
-
-            filtered = filtered[
-                filtered["PBR"].fillna(999)
-                <= pbr_max
-            ]
-
-            filtered = filtered.sort_values(
-                "スコア",
-                ascending=False,
+            df = df.sort_values(
+                "総合スコア",
+                ascending=False
             )
 
-            st.session_state["result_df"] = filtered
 
-
-    if "result_df" in st.session_state:
-
-        df = st.session_state["result_df"]
-
-        if df.empty:
-
-            st.warning(
-                "条件に合う銘柄がありません。"
-                "条件を少し緩めてみてください。"
-            )
-
-        else:
-
-            # --------------------------------
-            # TOP3
-            # --------------------------------
-
-            st.subheader("🥇 TOP PICKS")
-
-            top = df.head(3)
-
-            cols = st.columns(3)
-
-            medals = [
-                "🥇",
-                "🥈",
-                "🥉",
-            ]
-
-            for i, (_, row) in enumerate(top.iterrows()):
-
-                with cols[i]:
-
-                    st.markdown(
-                        f"### {medals[i]} {row['銘柄']}"
-                    )
-
-                    st.metric(
-                        "スコア",
-                        f"{int(row['スコア'])} / 100",
-                    )
-
-                    if pd.notna(row["株価"]):
-
-                        st.metric(
-                            "株価",
-                            f"¥{row['株価']:,.0f}",
-                        )
-
-                    if pd.notna(row["配当利回り"]):
-
-                        st.metric(
-                            "配当利回り",
-                            f"{row['配当利回り']:.2f}%",
-                        )
-
-            st.divider()
-
-            # --------------------------------
-            # 一覧
-            # --------------------------------
-
-            display_columns = [
-                "銘柄",
+            columns = [
+                "銘柄名",
                 "コード",
-                "スコア",
+                "総合スコア",
                 "株価",
                 "配当利回り",
+                "平均利回り5年",
+                "利回り平均との差",
+                "利回り倍率",
                 "PER",
                 "PBR",
                 "ROE",
-                "配当性向",
-                "騰落率",
-                "評価ポイント",
+                "配当CAGR",
+                "減配回数",
+                "52週高値乖離",
+                "最大DD",
             ]
 
-            display_df = df[
-                display_columns
-            ].copy()
+
+            display = df[
+                columns
+            ]
+
 
             st.dataframe(
-                display_df,
-                use_container_width=True,
+                display,
                 hide_index=True,
-                column_config={
-                    "株価": st.column_config.NumberColumn(
-                        format="¥%.0f"
-                    ),
-                    "配当利回り": st.column_config.NumberColumn(
-                        format="%.2f%%"
-                    ),
-                    "ROE": st.column_config.NumberColumn(
-                        format="%.2f%%"
-                    ),
-                    "配当性向": st.column_config.NumberColumn(
-                        format="%.1f%%"
-                    ),
-                    "騰落率": st.column_config.NumberColumn(
-                        format="%.2f%%"
-                    ),
-                    "スコア": st.column_config.ProgressColumn(
-                        min_value=0,
-                        max_value=100,
-                    ),
-                }
+                use_container_width=True,
             )
 
 
-# =========================================================
-# 個別銘柄分析
-# =========================================================
+            csv = (
+                display
+                .to_csv(
+                    index=False
+                )
+                .encode(
+                    "utf-8-sig"
+                )
+            )
 
-with tab2:
 
-    st.subheader("🔎 個別銘柄分析")
+            st.download_button(
+                "CSVダウンロード",
+                csv,
+                "stock_ranking.csv",
+                "text/csv",
+            )
 
-    stock_code = st.text_input(
-        "証券コード",
-        placeholder="例：8306",
+
+        else:
+
+            st.warning(
+                "条件に合う銘柄がありません。"
+            )
+
+
+# ============================================================
+# FAVORITES
+# ============================================================
+
+with tabs[2]:
+
+    st.subheader(
+        "お気に入り"
     )
 
-    if st.button(
-        "この銘柄を分析",
-        use_container_width=True,
-    ):
 
-        if stock_code:
-
-            ticker = (
-                stock_code.strip()
-                + ".T"
-            )
-
-            try:
-
-                stock = yf.Ticker(ticker)
-
-                info = stock.info
-
-                company_name = (
-                    info.get("longName")
-                    or info.get("shortName")
-                    or stock_code
-                )
-
-                row = get_stock_data(
-                    company_name,
-                    ticker,
-                )
-
-                score, reasons = calculate_score(
-                    row,
-                    mode,
-                )
-
-                st.header(company_name)
-
-                st.caption(
-                    f"証券コード：{stock_code}"
-                )
-
-                c1, c2, c3, c4 = st.columns(4)
-
-                with c1:
-
-                    if row["株価"] is not None:
-
-                        st.metric(
-                            "株価",
-                            f"¥{row['株価']:,.0f}",
-                        )
-
-                with c2:
-
-                    if row["配当利回り"] is not None:
-
-                        st.metric(
-                            "配当利回り",
-                            f"{row['配当利回り']:.2f}%",
-                        )
-
-                with c3:
-
-                    st.metric(
-                        "PER",
-                        (
-                            f"{row['PER']:.1f}倍"
-                            if row["PER"]
-                            else "-"
-                        ),
-                    )
-
-                with c4:
-
-                    st.metric(
-                        "総合スコア",
-                        f"{score}/100",
-                    )
-
-                st.subheader("📊 評価")
-
-                st.progress(
-                    score / 100
-                )
-
-                for reason in reasons:
-
-                    st.write(
-                        f"✅ {reason}"
-                    )
-
-                # --------------------------------
-                # チャート
-                # --------------------------------
-
-                st.subheader("📈 株価チャート")
-
-                period = st.selectbox(
-                    "期間",
-                    [
-                        "1mo",
-                        "3mo",
-                        "6mo",
-                        "1y",
-                        "2y",
-                        "5y",
-                    ],
-                    index=3,
-                )
-
-                hist = stock.history(
-                    period=period
-                )
-
-                if not hist.empty:
-
-                    st.line_chart(
-                        hist["Close"]
-                    )
-
-                # --------------------------------
-                # 詳細
-                # --------------------------------
-
-                st.subheader("企業指標")
-
-                metrics = pd.DataFrame({
-                    "指標": [
-                        "PER",
-                        "予想PER",
-                        "PBR",
-                        "ROE",
-                        "配当利回り",
-                        "配当性向",
-                    ],
-                    "値": [
-                        row["PER"],
-                        row["予想PER"],
-                        row["PBR"],
-                        row["ROE"],
-                        row["配当利回り"],
-                        row["配当性向"],
-                    ],
-                })
-
-                st.dataframe(
-                    metrics,
-                    hide_index=True,
-                    use_container_width=True,
-                )
-
-                # --------------------------------
-                # お気に入り
-                # --------------------------------
-
-                if "favorites" not in st.session_state:
-                    st.session_state["favorites"] = {}
-
-                if st.button(
-                    "⭐ お気に入りに追加"
-                ):
-
-                    st.session_state[
-                        "favorites"
-                    ][stock_code] = company_name
-
-                    st.success(
-                        "お気に入りに追加しました"
-                    )
-
-            except Exception as e:
-
-                st.error(
-                    "銘柄データを取得できませんでした。"
-                )
-
-
-# =========================================================
-# お気に入り
-# =========================================================
-
-with tab3:
-
-    st.subheader("⭐ お気に入り")
-
-    if "favorites" not in st.session_state:
-        st.session_state["favorites"] = {}
-
-    if not st.session_state["favorites"]:
+    if not st.session_state[
+        "favorites"
+    ]:
 
         st.info(
-            "お気に入り銘柄はまだありません。"
+            "お気に入りはまだありません。"
         )
+
 
     else:
 
-        for code, name in (
-            st.session_state["favorites"].items()
+        for code,name in (
+            st.session_state[
+                "favorites"
+            ].items()
         ):
 
             st.write(
-                f"⭐ {name}（{code}）"
+                f"⭐ {code} {name}"
             )
 
 
-# =========================================================
-# フッター
-# =========================================================
+# ============================================================
+# HELP
+# ============================================================
+
+with tabs[3]:
+
+    st.subheader(
+        "指標の見方"
+    )
+
+
+    st.markdown("""
+**現在利回り**  
+現在の株価に対する年間配当の割合。
+
+**5年平均利回り**  
+過去5年間の各年の年間配当と平均株価から計算した平均値。
+
+**平均との差**  
+現在利回り − 5年平均利回り。
+
+**利回り倍率**  
+現在利回り ÷ 5年平均利回り。
+
+**52週高値乖離**  
+現在株価が直近52週の高値から何％離れているか。
+
+**最大DD**  
+過去5年間で最も大きかった株価下落率。
+
+**配当CAGR**  
+年間配当の年平均成長率。
+""")
+
+
+# ============================================================
+# FOOTER
+# ============================================================
 
 st.divider()
 
 st.caption(
-    f"最終画面更新："
-    f"{datetime.now().strftime('%Y/%m/%d %H:%M')}"
+    "本アプリは銘柄比較用です。"
+    "表示データには遅延・欠損・取得元との差異が生じる場合があります。"
 )
 
 st.caption(
-    "株価・財務データには取得遅延・欠損が発生する場合があります。"
+    datetime.now().strftime(
+        "画面更新 %Y/%m/%d %H:%M"
+    )
 )
